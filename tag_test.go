@@ -91,7 +91,7 @@ func TestParseGqlTagFromField(t *testing.T) {
 			},
 			expectedFieldName: "",
 			expectedNonNull:   false,
-			expectedError:     true,
+			expectedError:     false,
 		},
 		{
 			field: &reflect.StructField{

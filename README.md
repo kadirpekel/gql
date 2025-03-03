@@ -1,15 +1,13 @@
-# Go GraphQL Schema Builder
+# Gql - The Missing GraphQL Schema Builder for Golang
 
-A flexible and type-safe GraphQL schema builder for Go that automatically generates GraphQL schemas from Go types and functions.
+A flexible and type-safe GraphQL schema builder for Go that automatically generates GraphQL schemas from Go types and functions. It nicely stands on the shoulders of [`github.com/graphql-go/graphql`](https://github.com/graphql-go/graphql), a battle-tested package widely used in production environments.
 
 ## Features
 
-- 🔄 Automatic schema generation from Go structs and functions
-- 🎯 Type-safe resolver functions
-- 🏗️ Builder pattern for easy schema construction
-- 💪 Support for Queries, Mutations, and Subscriptions
-- 🔍 Automatic field resolution based on struct tags
-- 📦 Built on top of graphql-go/graphql
+- **Type-Safe**: Uses Go types to define your GraphQL schema effortlessly.
+- **Automatic Schema Generation**: No need to manually define GraphQL types; just annotate your Go structs.
+- **Built on `graphql-go/graphql`**: Leverages an established GraphQL implementation for Go.
+- **Flexible and Extensible**: Supports custom resolvers, input types, and mutations.
 
 ## Installation
 
@@ -19,118 +17,106 @@ go get github.com/kadirpekel/gql
 
 ## Quick Start
 
-Here's a simple example of how to use the schema builder:
+Here's a simple example of how to define and use a GraphQL schema with `gql`:
 
 ```go
 package main
 
 import (
-    "github.com/kadirpekel/gql"
+	"fmt"
+	"github.com/kadirpekel/gql"
 )
 
 type User struct {
-    ID   string `gql:"id!"`
-    Name string `gql:"name"`
+	ID        string `gql:"ID"`
+	FirstName string `gql:"firstName"`
+	LastName  string `gql:"lastName"`
+}
+
+func (u *User) FullName() (string, error) {
+	return fmt.Sprintf("%s %s", u.FirstName, u.LastName), nil
+}
+
+type UserInput struct {
+	ID string `gql:"ID,nonNull"`
+}
+
+type query struct{}
+
+func (q query) GetUser(args UserInput) (*User, error) {
+	return &User{ID: args.ID, FirstName: "John", LastName: "Doe"}, nil
+}
+
+func (q query) ListUsers() ([]*User, error) {
+	return []*User{
+		{ID: "1", FirstName: "John", LastName: "Doe"},
+		{ID: "2", FirstName: "Jane", LastName: "Doe"},
+	}, nil
 }
 
 func main() {
-    query := map[string]interface{}{
-        "getUser": func(id string) *User {
-            return &User{ID: id, Name: "John Doe"}
-        },
-    }
+	schema, err := gql.NewSchemaBuilder().
+		WithQuery(query{}).
+		BuildSchema()
 
-    builder := gql.NewSchemaBuilder().
-        WithQuery(query)
+	if err != nil {
+		panic(err)
+	}
 
-    schema, err := builder.BuildSchema()
-    if err != nil {
-        panic(err)
-    }
-
-    // Use the schema with your GraphQL server
+	// Built schema is already the schema object 
+    // comes from graphql-go/graphql where you can
+    // still modify it as per your needs.
 }
 ```
 
-## Usage
+## Defining Mutations
 
-### Creating a Schema
-
-The schema builder supports three main operation types:
-- Queries (read operations)
-- Mutations (write operations)
-- Subscriptions (real-time updates)
+You can also define mutations using the same approach:
 
 ```go
-builder := gql.NewSchemaBuilder().
-    WithQuery(queryMap).
-    WithMutation(mutationMap).
-    WithSubscription(subscriptionMap)
+type mutation struct{}
+
+func (m mutation) CreateUser(args User) (*User, error) {
+	return &User{ID: "3", FirstName: args.FirstName, LastName: args.LastName}, nil
+}
 ```
 
-### Defining Types
-
-Use struct tags to define GraphQL fields:
+Then include it in your schema:
 
 ```go
-type Product struct {
-    ID          string  `gql:"id!"`      // Non-null field
-    Name        string  `gql:"name"`     // Nullable field
-    Price       float64 `gql:"price"`
-    Description string                   // Ignored field
-}
+schema, err := gql.NewSchemaBuilder().
+	WithQuery(query{}).
+	WithMutation(mutation{}).
+	BuildSchema()
 ```
 
-### Custom Resolvers
+## Running on a GraphQL Server
 
-You can define custom resolvers for fields using the `Resolve` prefix:
+To integrate with a GraphQL server, use `github.com/graphql-go/handler`:
 
 ```go
-func (p *Product) ResolvePrice(ctx context.Context) float64 {
-    // Custom price calculation logic
-    return p.Price * 1.2
+import (
+	"net/http"
+	"github.com/graphql-go/handler"
+)
+
+func main() {
+	schema, err := gql.NewSchemaBuilder().WithQuery(query{}).BuildSchema()
+	if err != nil {
+		panic(err)
+	}
+
+	h := handler.New(&handler.Config{
+		Schema:   schema,
+		GraphiQL: true,
+	})
+
+	http.Handle("/graphql", h)
+	http.ListenAndServe(":8080", nil)
 }
 ```
-
-### Field Arguments
-
-Support for field arguments in resolvers:
-
-```go
-type PriceInput struct {
-    Currency string `gql:"currency!"`
-}
-
-func (p *Product) ResolvePrice(ctx context.Context, input PriceInput) float64 {
-    // Convert price based on currency
-    return convertPrice(p.Price, input.Currency)
-}
-```
-
-## Supported Types
-
-- Basic Types: `int`, `string`, `bool`, `float64`
-- Arrays/Slices
-- Structs
-- Pointers to any supported type
-- Custom types via struct tags
-
-## Error Handling
-
-The builder provides detailed error messages for:
-- Invalid type definitions
-- Resolver function signature mismatches
-- Schema construction errors
-- Type conversion errors
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-[Your chosen license]
+This project is licensed under the MIT License.
 
-## Credits
-
-Built with [graphql-go/graphql](https://github.com/graphql-go/graphql)

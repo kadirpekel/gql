@@ -8,10 +8,18 @@ import (
 	"github.com/graphql-go/graphql"
 )
 
+type RootType string
+
+const (
+	Query        RootType = "Query"
+	Mutation     RootType = "Mutation"
+	Subscription RootType = "Subscription"
+)
+
 type SchemaBuilder struct {
-	query        map[string]interface{}
-	mutation     map[string]interface{}
-	subscription map[string]interface{}
+	query        interface{}
+	mutation     interface{}
+	subscription interface{}
 	typeRegistry map[reflect.Type]graphql.Output
 }
 
@@ -21,46 +29,47 @@ func NewSchemaBuilder() *SchemaBuilder {
 	}
 }
 
-func (b *SchemaBuilder) WithQuery(query map[string]interface{}) *SchemaBuilder {
+func (b *SchemaBuilder) WithQuery(query interface{}) *SchemaBuilder {
 	b.query = query
 	return b
 }
 
-func (b *SchemaBuilder) WithMutation(mutation map[string]interface{}) *SchemaBuilder {
+func (b *SchemaBuilder) WithMutation(mutation interface{}) *SchemaBuilder {
 	b.mutation = mutation
 	return b
 }
 
-func (b *SchemaBuilder) WithSubscription(subscription map[string]interface{}) *SchemaBuilder {
+func (b *SchemaBuilder) WithSubscription(subscription interface{}) *SchemaBuilder {
 	b.subscription = subscription
 	return b
 }
 
 func (b *SchemaBuilder) BuildSchemaConfig() (*graphql.SchemaConfig, error) {
 
-	var queryObject *graphql.Object
-	var err error
+	var queryObject, mutationObject, subscriptionObject *graphql.Object
+
 	if b.query != nil {
-		queryObject, err = b.MapAsGraphqlObject("Query", b.query)
+		graphqlField, err := b.TypeAsGraphqlField(reflect.TypeOf(b.query))
 		if err != nil {
 			return nil, fmt.Errorf("failed to build query type: %w", err)
 		}
+		queryObject = graphqlField.Type.(*graphql.Object)
 	}
 
-	var mutationObject *graphql.Object
 	if b.mutation != nil {
-		mutationObject, err = b.MapAsGraphqlObject("Mutation", b.mutation)
+		graphqlField, err := b.TypeAsGraphqlField(reflect.TypeOf(b.mutation))
 		if err != nil {
 			return nil, fmt.Errorf("failed to build mutation type: %w", err)
 		}
+		mutationObject = graphqlField.Type.(*graphql.Object)
 	}
 
-	var subscriptionObject *graphql.Object
 	if b.subscription != nil {
-		subscriptionObject, err = b.MapAsGraphqlObject("Subscription", b.subscription)
+		graphqlField, err := b.TypeAsGraphqlField(reflect.TypeOf(b.subscription))
 		if err != nil {
 			return nil, fmt.Errorf("failed to build subscription type: %w", err)
 		}
+		subscriptionObject = graphqlField.Type.(*graphql.Object)
 	}
 
 	return &graphql.SchemaConfig{
@@ -82,43 +91,9 @@ func (b *SchemaBuilder) BuildSchema() (*graphql.Schema, error) {
 	return &schema, nil
 }
 
-func (b *SchemaBuilder) MapAsGraphqlObject(name string, iface map[string]interface{}) (*graphql.Object, error) {
-	fields := graphql.Fields{}
-	for fieldName, fn := range iface {
-		// get fn as a reflect.Func
-		fnValue := reflect.ValueOf(fn)
-		if fnValue.Kind() != reflect.Func {
-			return nil, fmt.Errorf("field %s is not a method", fieldName)
-		}
-		resolveInfo, err := NewResolveInfo(fnValue, false)
-		if err != nil {
-			return nil, err
-		}
-
-		if resolveInfo.Output == nil {
-			return nil, fmt.Errorf("unbound resolvers should have an output type, %s", fieldName)
-		}
-
-		graphqlField, err := b.ReflectTypeAsGraphqlField(resolveInfo.Output.Type)
-		if err != nil {
-			return nil, err
-		}
-
-		graphqlField.Resolve = resolveInfo.Resolve
-		if resolveInfo.Input != nil {
-			err := b.populateGraphqlFieldArgs(graphqlField, resolveInfo.Input.Type)
-			if err != nil {
-				return nil, err
-			}
-		}
-		fields[fieldName] = graphqlField
-	}
-	return graphql.NewObject(graphql.ObjectConfig{Name: name, Fields: fields}), nil
-}
-
-func (b *SchemaBuilder) ReflectTypeAsGraphqlField(definition reflect.Type) (*graphql.Field, error) {
+func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Field, error) {
 	switch definition.Kind() {
-	case reflect.Int:
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return &graphql.Field{
 			Type: graphql.Int,
 		}, nil
@@ -130,12 +105,12 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlField(definition reflect.Type) (*gra
 		return &graphql.Field{
 			Type: graphql.Boolean,
 		}, nil
-	case reflect.Float64:
+	case reflect.Float64, reflect.Float32:
 		return &graphql.Field{
 			Type: graphql.Float,
 		}, nil
-	case reflect.Slice:
-		elemField, err := b.ReflectTypeAsGraphqlField(definition.Elem())
+	case reflect.Slice, reflect.Array:
+		elemField, err := b.TypeAsGraphqlField(definition.Elem())
 		if err != nil {
 			return nil, err
 		}
@@ -150,7 +125,7 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlField(definition reflect.Type) (*gra
 			realDefinition = definition.Elem()
 
 			if realDefinition.Kind() != reflect.Struct {
-				return b.ReflectTypeAsGraphqlField(realDefinition)
+				return b.TypeAsGraphqlField(realDefinition)
 			}
 		}
 
@@ -166,7 +141,7 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlField(definition reflect.Type) (*gra
 				continue
 			}
 
-			graphqlField, err := b.ReflectTypeAsGraphqlField(field.Type)
+			graphqlField, err := b.TypeAsGraphqlField(field.Type)
 			if err != nil {
 				return nil, err
 			}
@@ -177,32 +152,34 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlField(definition reflect.Type) (*gra
 				graphqlField.Type = graphql.NewNonNull(graphqlField.Type)
 			}
 
-			resolveMethodName := ResolvePrefix + strings.Title(field.Name)
-			method, ok := definition.MethodByName(resolveMethodName)
-			if ok {
-				resolveInfo, err := NewResolveInfo(method.Func, true)
+			fields[fieldName] = graphqlField
+		}
+
+		for i := 0; i < definition.NumMethod(); i++ {
+			method := definition.Method(i)
+			if method.IsExported() {
+				fieldName := strings.ToLower(method.Name[0:1]) + method.Name[1:]
+
+				resolveInfo, err := NewResolveInfo(method.Func)
 				if err != nil {
 					return nil, err
 				}
+
+				graphqlField, err := b.TypeAsGraphqlField(resolveInfo.Output.Type)
+				if err != nil {
+					return nil, err
+				}
+
+				graphqlField.Name = fieldName
 				graphqlField.Resolve = resolveInfo.Resolve
-
-				if resolveInfo.Output != nil {
-					if resolveInfo.Output.Type != field.Type {
-						return nil, fmt.Errorf("output type %s does not match field type %s", resolveInfo.Output.Type, field.Type)
-					}
-				}
-
 				if resolveInfo.Input != nil {
-					if resolveInfo.Input != nil {
-						err := b.populateGraphqlFieldArgs(graphqlField, resolveInfo.Input.Type)
-						if err != nil {
-							return nil, err
-						}
+					err := b.populateGraphqlFieldArgs(graphqlField, resolveInfo.Input.Type)
+					if err != nil {
+						return nil, err
 					}
 				}
+				fields[fieldName] = graphqlField
 			}
-
-			fields[fieldName] = graphqlField
 		}
 
 		graphqlType, ok := b.typeRegistry[realDefinition]
@@ -217,13 +194,9 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlField(definition reflect.Type) (*gra
 	}
 }
 
-const (
-	ResolvePrefix = "Resolve"
-)
-
-func (b *SchemaBuilder) ReflectTypeAsGraphqlArgumentConfig(definition reflect.Type) (*graphql.ArgumentConfig, error) {
+func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*graphql.ArgumentConfig, error) {
 	switch definition.Kind() {
-	case reflect.Int:
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return &graphql.ArgumentConfig{
 			Type: graphql.Int,
 		}, nil
@@ -235,12 +208,12 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlArgumentConfig(definition reflect.Ty
 		return &graphql.ArgumentConfig{
 			Type: graphql.Boolean,
 		}, nil
-	case reflect.Float64:
+	case reflect.Float64, reflect.Float32:
 		return &graphql.ArgumentConfig{
 			Type: graphql.Float,
 		}, nil
-	case reflect.Slice:
-		elemConfig, err := b.ReflectTypeAsGraphqlArgumentConfig(definition.Elem())
+	case reflect.Slice, reflect.Array:
+		elemConfig, err := b.TypeAsGraphqlArgumentConfig(definition.Elem())
 		if err != nil {
 			return nil, err
 		}
@@ -248,7 +221,7 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlArgumentConfig(definition reflect.Ty
 			Type: graphql.NewList(elemConfig.Type),
 		}, nil
 	case reflect.Ptr:
-		return b.ReflectTypeAsGraphqlArgumentConfig(definition.Elem())
+		return b.TypeAsGraphqlArgumentConfig(definition.Elem())
 	case reflect.Struct:
 		fields := graphql.InputObjectConfigFieldMap{}
 		for i := 0; i < definition.NumField(); i++ {
@@ -262,7 +235,7 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlArgumentConfig(definition reflect.Ty
 				continue
 			}
 
-			fieldConfig, err := b.ReflectTypeAsGraphqlArgumentConfig(field.Type)
+			fieldConfig, err := b.TypeAsGraphqlArgumentConfig(field.Type)
 			if err != nil {
 				return nil, err
 			}
@@ -284,7 +257,7 @@ func (b *SchemaBuilder) ReflectTypeAsGraphqlArgumentConfig(definition reflect.Ty
 }
 
 func (b *SchemaBuilder) populateGraphqlFieldArgs(graphqlField *graphql.Field, definition reflect.Type) error {
-	argumentConfig, err := b.ReflectTypeAsGraphqlArgumentConfig(definition)
+	argumentConfig, err := b.TypeAsGraphqlArgumentConfig(definition)
 	if err != nil {
 		return err
 	}
