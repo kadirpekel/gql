@@ -2,6 +2,11 @@
 
 A flexible and type-safe GraphQL schema builder for Go that automatically generates GraphQL schemas from Go types and functions. It nicely stands on the shoulders of [`github.com/graphql-go/graphql`](https://github.com/graphql-go/graphql), a battle-tested package widely used in production environments.
 
+## Why Gql?
+
+GraphQL in Go can be frustrating. If you've tried [`gqlgen`](https://github.com/99designs/gqlgen), you might have been overwhelmed by the code generation, hidden complexity, and unnecessary bloat. On the other hand, [`graphql-go/graphql`](https://github.com/graphql-go/graphql) offers a more manual approach but comes with verbosity and an unintuitive structure that makes schema definition cumbersome. **Gql** is here to solve that problem by providing a flexible, type-safe, and intuitive way to build GraphQL schemas directly from Go types and functions—without code generation or unnecessary boilerplate.
+
+
 ## Features
 
 - **Type-Safe**: Uses Go types to define your GraphQL schema effortlessly.
