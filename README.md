@@ -153,7 +153,7 @@ func main() {
 }
 ```
 
-img[]![graphiql](https://github.com/kadirpekel/gql/blob/main/assets/graphiql.png?raw=true)
+![graphiql](https://github.com/kadirpekel/gql/blob/main/assets/graphiql.png?raw=true)
 
 ## License
 
