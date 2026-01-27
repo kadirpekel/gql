@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/graphql-go/graphql"
+	"github.com/graphql-go/graphql/language/ast"
 )
 
 type RootType string
@@ -21,13 +23,76 @@ type SchemaBuilder struct {
 	mutation     interface{}
 	subscription interface{}
 	typeRegistry map[reflect.Type]graphql.Output
+	customTypes  map[reflect.Type]graphql.Output
+	processing   map[reflect.Type]bool // Track types currently being processed to prevent cycles
+	fieldsCache  map[reflect.Type]graphql.Fields // Cache fields for types being processed
 }
 
 func NewSchemaBuilder() *SchemaBuilder {
-	return &SchemaBuilder{
+	sb := &SchemaBuilder{
 		typeRegistry: make(map[reflect.Type]graphql.Output),
+		customTypes:  make(map[reflect.Type]graphql.Output),
+		processing:   make(map[reflect.Type]bool),
+		fieldsCache:  make(map[reflect.Type]graphql.Fields),
 	}
+	
+	// Register default custom types (standard library types only)
+	// Framework-specific types (e.g., gorm.DeletedAt) should be registered
+	// by the application using RegisterCustomType()
+	sb.RegisterCustomType(reflect.TypeOf(time.Time{}), createDateTimeScalar())
+	sb.RegisterCustomType(reflect.TypeOf((*time.Time)(nil)).Elem(), createDateTimeScalar())
+	
+	return sb
 }
+
+// RegisterCustomType registers a custom type mapping
+func (b *SchemaBuilder) RegisterCustomType(goType reflect.Type, graphqlType graphql.Output) {
+	b.customTypes[goType] = graphqlType
+}
+
+// createDateTimeScalar creates a DateTime scalar for time.Time
+func createDateTimeScalar() *graphql.Scalar {
+	return graphql.NewScalar(graphql.ScalarConfig{
+		Name:        "DateTime",
+		Description: "DateTime scalar type (RFC3339 format)",
+		Serialize: func(value interface{}) interface{} {
+			switch v := value.(type) {
+			case time.Time:
+				return v.Format(time.RFC3339)
+			case *time.Time:
+				if v == nil {
+					return nil
+				}
+				return v.Format(time.RFC3339)
+			default:
+				return nil
+			}
+		},
+		ParseValue: func(value interface{}) interface{} {
+			switch v := value.(type) {
+			case string:
+				t, err := time.Parse(time.RFC3339, v)
+				if err != nil {
+					return nil
+				}
+				return t
+			default:
+				return nil
+			}
+		},
+		ParseLiteral: func(valueAST ast.Value) interface{} {
+			if strValue, ok := valueAST.(*ast.StringValue); ok {
+				t, err := time.Parse(time.RFC3339, strValue.Value)
+				if err != nil {
+					return nil
+				}
+				return t
+			}
+			return nil
+		},
+	})
+}
+
 
 func (b *SchemaBuilder) WithQuery(query interface{}) *SchemaBuilder {
 	b.query = query
@@ -92,6 +157,13 @@ func (b *SchemaBuilder) BuildSchema() (*graphql.Schema, error) {
 }
 
 func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Field, error) {
+	// Check for custom type mappings first
+	if customType, ok := b.customTypes[definition]; ok {
+		return &graphql.Field{
+			Type: customType,
+		}, nil
+	}
+	
 	switch definition.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return &graphql.Field{
@@ -129,6 +201,41 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 			}
 		}
 
+		// Check if this type is already registered (prevents infinite recursion)
+		if existingType, ok := b.typeRegistry[realDefinition]; ok {
+			return &graphql.Field{Type: existingType}, nil
+		}
+
+		// Check if this type is currently being processed (circular reference)
+		if b.processing[realDefinition] {
+			// For circular references, return the placeholder that was already created
+			// The thunk will resolve fields from the cache when ready
+			if existingType, ok := b.typeRegistry[realDefinition]; ok {
+				return &graphql.Field{Type: existingType}, nil
+			}
+			// Create placeholder with thunk that reads from fields cache
+			builderRef := b
+			typeRef := realDefinition
+			placeholder := graphql.NewObject(graphql.ObjectConfig{
+				Name: realDefinition.Name(),
+				Fields: graphql.FieldsThunk(func() graphql.Fields {
+					// Read fields from cache (populated when processing completes)
+					if fields, ok := builderRef.fieldsCache[typeRef]; ok {
+						return fields
+					}
+					return graphql.Fields{}
+				}),
+			})
+			b.typeRegistry[realDefinition] = placeholder
+			return &graphql.Field{Type: placeholder}, nil
+		}
+
+		// Mark as processing
+		b.processing[realDefinition] = true
+		defer func() {
+			delete(b.processing, realDefinition)
+		}()
+
 		fields := graphql.Fields{}
 		for _, field := range reflect.VisibleFields(realDefinition) {
 			fieldName, isNonNull, err := GetGqlTag(&field)
@@ -158,12 +265,14 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 		for i := 0; i < definition.NumMethod(); i++ {
 			method := definition.Method(i)
 			if method.IsExported() {
-				fieldName := strings.ToLower(method.Name[0:1]) + method.Name[1:]
-
+				// Skip methods that don't match resolver signature (e.g., TableName(), BeforeCreate(), etc.)
 				resolveInfo, err := NewResolveInfo(method.Func)
 				if err != nil {
-					return nil, err
+					// Not a valid resolver, skip it
+					continue
 				}
+
+				fieldName := strings.ToLower(method.Name[0:1]) + method.Name[1:]
 
 				graphqlField, err := b.TypeAsGraphqlField(resolveInfo.Output.Type)
 				if err != nil {
@@ -182,11 +291,23 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 			}
 		}
 
-		graphqlType, ok := b.typeRegistry[realDefinition]
-		if !ok {
-			graphqlType = graphql.NewObject(graphql.ObjectConfig{Name: realDefinition.Name(), Fields: fields})
-			b.typeRegistry[realDefinition] = graphqlType
+		// Store fields in cache for thunk-based placeholders
+		b.fieldsCache[realDefinition] = fields
+		
+		// Check if a placeholder was already created (due to circular reference)
+		if existingType, ok := b.typeRegistry[realDefinition]; ok {
+			// Placeholder exists - return it (its thunk will read from fieldsCache)
+			return &graphql.Field{Type: existingType}, nil
 		}
+		
+		// Create the object with populated fields
+		graphqlType := graphql.NewObject(graphql.ObjectConfig{
+			Name:   realDefinition.Name(),
+			Fields: fields,
+		})
+		
+		// Register the fully populated object
+		b.typeRegistry[realDefinition] = graphqlType
 
 		return &graphql.Field{Type: graphqlType}, nil
 	default:
@@ -195,6 +316,13 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 }
 
 func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*graphql.ArgumentConfig, error) {
+	// Check for custom type mappings first
+	if customType, ok := b.customTypes[definition]; ok {
+		return &graphql.ArgumentConfig{
+			Type: customType,
+		}, nil
+	}
+	
 	switch definition.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return &graphql.ArgumentConfig{
