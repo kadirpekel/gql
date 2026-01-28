@@ -189,6 +189,11 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 		return &graphql.Field{
 			Type: graphql.NewList(elemField.Type),
 		}, nil
+	case reflect.Map:
+		// Maps are not directly supported in GraphQL
+		// They should be excluded using gql:"-" tag
+		// If we reach here, it means a map type was encountered without exclusion
+		return nil, fmt.Errorf("map types are not supported in GraphQL schema. Use gql:\"-\" tag to exclude map fields")
 	// struct or pointer to struct including slices
 	case reflect.Struct, reflect.Ptr:
 		realDefinition := definition
@@ -243,8 +248,8 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 				return nil, err
 			}
 
-			// if the tag is empty, skip the field, we're interested in fields with a gql tag
-			if fieldName == "" {
+			// if the tag is empty or "-", skip the field, we're interested in fields with a gql tag
+			if fieldName == "" || fieldName == "-" {
 				continue
 			}
 
@@ -300,9 +305,22 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 			return &graphql.Field{Type: existingType}, nil
 		}
 		
+		// Check if type has a custom GraphQL type name method
+		typeName := realDefinition.Name()
+		if method, ok := realDefinition.MethodByName("GraphQLTypeName"); ok {
+			if method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
+				// Call the method on a zero value to get the type name
+				zeroValue := reflect.New(realDefinition).Elem()
+				result := method.Func.Call([]reflect.Value{zeroValue})
+				if len(result) > 0 && result[0].Kind() == reflect.String {
+					typeName = result[0].String()
+				}
+			}
+		}
+		
 		// Create the object with populated fields
 		graphqlType := graphql.NewObject(graphql.ObjectConfig{
-			Name:   realDefinition.Name(),
+			Name:   typeName,
 			Fields: fields,
 		})
 		
@@ -359,7 +377,7 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 				return nil, err
 			}
 
-			if fieldName == "" {
+			if fieldName == "" || fieldName == "-" {
 				continue
 			}
 
