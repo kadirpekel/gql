@@ -169,6 +169,10 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 		return &graphql.Field{
 			Type: graphql.Int,
 		}, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return &graphql.Field{
+			Type: graphql.Int,
+		}, nil
 	case reflect.String:
 		return &graphql.Field{
 			Type: graphql.String,
@@ -343,6 +347,10 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 	
 	switch definition.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return &graphql.ArgumentConfig{
+			Type: graphql.Int,
+		}, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return &graphql.ArgumentConfig{
 			Type: graphql.Int,
 		}, nil
