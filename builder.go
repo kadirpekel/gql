@@ -19,29 +19,31 @@ const (
 )
 
 type SchemaBuilder struct {
-	query        interface{}
-	mutation     interface{}
-	subscription interface{}
-	typeRegistry map[reflect.Type]graphql.Output
-	customTypes  map[reflect.Type]graphql.Output
-	processing   map[reflect.Type]bool // Track types currently being processed to prevent cycles
-	fieldsCache  map[reflect.Type]graphql.Fields // Cache fields for types being processed
+	query         interface{}
+	mutation      interface{}
+	subscription  interface{}
+	typeRegistry  map[reflect.Type]graphql.Output
+	customTypes   map[reflect.Type]graphql.Output
+	processing    map[reflect.Type]bool           // Track types currently being processed to prevent cycles
+	fieldsCache   map[reflect.Type]graphql.Fields // Cache fields for types being processed
+	rootInstances map[reflect.Type]interface{}    // Registry for root instances (Query, Mutation)
 }
 
 func NewSchemaBuilder() *SchemaBuilder {
 	sb := &SchemaBuilder{
-		typeRegistry: make(map[reflect.Type]graphql.Output),
-		customTypes:  make(map[reflect.Type]graphql.Output),
-		processing:   make(map[reflect.Type]bool),
-		fieldsCache:  make(map[reflect.Type]graphql.Fields),
+		typeRegistry:  make(map[reflect.Type]graphql.Output),
+		customTypes:   make(map[reflect.Type]graphql.Output),
+		processing:    make(map[reflect.Type]bool),
+		fieldsCache:   make(map[reflect.Type]graphql.Fields),
+		rootInstances: make(map[reflect.Type]interface{}),
 	}
-	
+
 	// Register default custom types (standard library types only)
 	// Framework-specific types (e.g., gorm.DeletedAt) should be registered
 	// by the application using RegisterCustomType()
 	sb.RegisterCustomType(reflect.TypeOf(time.Time{}), createDateTimeScalar())
 	sb.RegisterCustomType(reflect.TypeOf((*time.Time)(nil)).Elem(), createDateTimeScalar())
-	
+
 	return sb
 }
 
@@ -93,19 +95,39 @@ func createDateTimeScalar() *graphql.Scalar {
 	})
 }
 
-
 func (b *SchemaBuilder) WithQuery(query interface{}) *SchemaBuilder {
 	b.query = query
+	if query != nil {
+		t := reflect.TypeOf(query)
+		if t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
+		b.rootInstances[t] = query
+	}
 	return b
 }
 
 func (b *SchemaBuilder) WithMutation(mutation interface{}) *SchemaBuilder {
 	b.mutation = mutation
+	if mutation != nil {
+		t := reflect.TypeOf(mutation)
+		if t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
+		b.rootInstances[t] = mutation
+	}
 	return b
 }
 
 func (b *SchemaBuilder) WithSubscription(subscription interface{}) *SchemaBuilder {
 	b.subscription = subscription
+	if subscription != nil {
+		t := reflect.TypeOf(subscription)
+		if t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
+		b.rootInstances[t] = subscription
+	}
 	return b
 }
 
@@ -163,7 +185,7 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 			Type: customType,
 		}, nil
 	}
-	
+
 	switch definition.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return &graphql.Field{
@@ -281,6 +303,12 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 					continue
 				}
 
+				// UPDATE: Check if we have a bound instance for this type
+				if instance, ok := b.rootInstances[realDefinition]; ok {
+					val := reflect.ValueOf(instance)
+					resolveInfo.BoundReceiver = &val
+				}
+
 				fieldName := strings.ToLower(method.Name[0:1]) + method.Name[1:]
 
 				graphqlField, err := b.TypeAsGraphqlField(resolveInfo.Output.Type)
@@ -302,13 +330,13 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 
 		// Store fields in cache for thunk-based placeholders
 		b.fieldsCache[realDefinition] = fields
-		
+
 		// Check if a placeholder was already created (due to circular reference)
 		if existingType, ok := b.typeRegistry[realDefinition]; ok {
 			// Placeholder exists - return it (its thunk will read from fieldsCache)
 			return &graphql.Field{Type: existingType}, nil
 		}
-		
+
 		// Check if type has a custom GraphQL type name method
 		typeName := realDefinition.Name()
 		if method, ok := realDefinition.MethodByName("GraphQLTypeName"); ok {
@@ -321,13 +349,13 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 				}
 			}
 		}
-		
+
 		// Create the object with populated fields
 		graphqlType := graphql.NewObject(graphql.ObjectConfig{
 			Name:   typeName,
 			Fields: fields,
 		})
-		
+
 		// Register the fully populated object
 		b.typeRegistry[realDefinition] = graphqlType
 
@@ -344,7 +372,7 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 			Type: customType,
 		}, nil
 	}
-	
+
 	switch definition.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return &graphql.ArgumentConfig{
@@ -411,16 +439,44 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 }
 
 func (b *SchemaBuilder) populateGraphqlFieldArgs(graphqlField *graphql.Field, definition reflect.Type) error {
-	argumentConfig, err := b.TypeAsGraphqlArgumentConfig(definition)
-	if err != nil {
-		return err
+	// Handle pointer types
+	if definition.Kind() == reflect.Ptr {
+		definition = definition.Elem()
 	}
-	argFields := argumentConfig.Type.(*graphql.InputObject).Fields()
+
+	if definition.Kind() != reflect.Struct {
+		return fmt.Errorf("Arguments type must be a struct, got %s", definition.Kind())
+	}
+
 	graphqlField.Args = graphql.FieldConfigArgument{}
-	for fieldName, argField := range argFields {
-		graphqlField.Args[fieldName] = &graphql.ArgumentConfig{
-			Type: argField.Type,
+
+	// Iterate over struct fields directly
+	// This supports both named and anonymous structs
+	for i := 0; i < definition.NumField(); i++ {
+		field := definition.Field(i)
+
+		fieldName, isNonNull, err := GetGqlTag(&field)
+		if err != nil {
+			return err
 		}
+
+		// Skip fields without valid tags
+		if fieldName == "" || fieldName == "-" {
+			continue
+		}
+
+		// Create argument config for the field
+		fieldArgConfig, err := b.TypeAsGraphqlArgumentConfig(field.Type)
+		if err != nil {
+			return err
+		}
+
+		if isNonNull {
+			fieldArgConfig.Type = graphql.NewNonNull(fieldArgConfig.Type)
+		}
+
+		graphqlField.Args[fieldName] = fieldArgConfig
 	}
+
 	return nil
 }

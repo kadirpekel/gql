@@ -28,6 +28,10 @@ type ResolveInfo struct {
 	Input   *ArgInfo
 	Output  *ArgInfo
 	Error   *ArgInfo
+
+	// BoundReceiver holds the instance to be used as the receiver
+	// If set, Source.ValueFrom(p.Source) is skipped for the receiver
+	BoundReceiver *reflect.Value
 }
 
 func hasStructValidGqlTag(t reflect.Type) bool {
@@ -47,6 +51,9 @@ func (r *ResolveInfo) Validate() error {
 		}
 
 		if !hasStructValidGqlTag(r.Input.RealType) {
+			// Check if it's an anonymous struct (empty name) or named struct
+			// For anonymous structs used as args, we might be more lenient or strict
+			// But for now keeping validation
 			return fmt.Errorf("Input type should have at least one field with a gql tag")
 		}
 	}
@@ -132,12 +139,17 @@ func (r *ResolveInfo) Resolve(p graphql.ResolveParams) (interface{}, error) {
 	args := make([]reflect.Value, r.Func.Type().NumIn())
 	var err error
 
-	args[0], err = r.Source.ValueFrom(p.Source)
-	if err != nil {
-		return nil, err
+	if r.BoundReceiver != nil {
+		args[0] = *r.BoundReceiver
+	} else {
+		args[0], err = r.Source.ValueFrom(p.Source)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// If there is an input, place it in the input index
+
 	if r.Input != nil {
 		args[r.Input.Index], err = r.Input.ValueFrom(p.Args)
 		if err != nil {
