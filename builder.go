@@ -1,6 +1,7 @@
 package gql
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"reflect"
 	"strings"
@@ -19,23 +20,31 @@ const (
 )
 
 type SchemaBuilder struct {
-	query         interface{}
-	mutation      interface{}
-	subscription  interface{}
-	typeRegistry  map[reflect.Type]graphql.Output
-	customTypes   map[reflect.Type]graphql.Output
-	processing    map[reflect.Type]bool           // Track types currently being processed to prevent cycles
-	fieldsCache   map[reflect.Type]graphql.Fields // Cache fields for types being processed
-	rootInstances map[reflect.Type]interface{}    // Registry for root instances (Query, Mutation)
+	query                interface{}
+	mutation             interface{}
+	subscription         interface{}
+	typeRegistry         map[reflect.Type]graphql.Output
+	customTypes          map[reflect.Type]graphql.Output
+	processing           map[reflect.Type]bool           // Track types currently being processed to prevent cycles
+	fieldsCache          map[reflect.Type]graphql.Fields // Cache fields for types being processed
+	rootInstances        map[reflect.Type]interface{}    // Registry for root instances (Query, Mutation)
+	typeHashRegistry     map[string]string               // Map struct hash to canonical GraphQL type name
+	allowSharedTypes     bool                            // Enable/disable type deduplication
+	structHashCache      map[reflect.Type]string         // Cache struct hashes to avoid recalculation
+	registeredInputTypes map[string]bool                 // Track registered input types to prevent duplicates
 }
 
 func NewSchemaBuilder() *SchemaBuilder {
 	sb := &SchemaBuilder{
-		typeRegistry:  make(map[reflect.Type]graphql.Output),
-		customTypes:   make(map[reflect.Type]graphql.Output),
-		processing:    make(map[reflect.Type]bool),
-		fieldsCache:   make(map[reflect.Type]graphql.Fields),
-		rootInstances: make(map[reflect.Type]interface{}),
+		typeRegistry:         make(map[reflect.Type]graphql.Output),
+		customTypes:          make(map[reflect.Type]graphql.Output),
+		processing:           make(map[reflect.Type]bool),
+		fieldsCache:          make(map[reflect.Type]graphql.Fields),
+		rootInstances:        make(map[reflect.Type]interface{}),
+		typeHashRegistry:     make(map[string]string),
+		allowSharedTypes:     true, // Enable by default
+		structHashCache:      make(map[reflect.Type]string),
+		registeredInputTypes: make(map[string]bool),
 	}
 
 	// Register default custom types (standard library types only)
@@ -50,6 +59,38 @@ func NewSchemaBuilder() *SchemaBuilder {
 // RegisterCustomType registers a custom type mapping
 func (b *SchemaBuilder) RegisterCustomType(goType reflect.Type, graphqlType graphql.Output) {
 	b.customTypes[goType] = graphqlType
+}
+
+// AllowSharedTypes enables or disables type deduplication
+func (b *SchemaBuilder) AllowSharedTypes(allow bool) *SchemaBuilder {
+	b.allowSharedTypes = allow
+	return b
+}
+
+// structHash computes a hash of a struct's fields for deduplication
+// This hash represents the structural identity of a type (field names and types)
+func (b *SchemaBuilder) structHash(definition reflect.Type) string {
+	// Check cache first
+	if hash, ok := b.structHashCache[definition]; ok {
+		return hash
+	}
+
+	// Build hash from struct fields
+	h := sha256.New()
+	fmt.Fprintf(h, "struct:%s:", definition.String())
+
+	for _, field := range reflect.VisibleFields(definition) {
+		fieldName, _, err := GetGqlTag(&field)
+		if err != nil || fieldName == "" || fieldName == "-" {
+			continue
+		}
+		// Include field name and type in hash
+		fmt.Fprintf(h, "%s:%s;", fieldName, field.Type.String())
+	}
+
+	hash := fmt.Sprintf("%x", h.Sum(nil))
+	b.structHashCache[definition] = hash
+	return hash
 }
 
 // createDateTimeScalar creates a DateTime scalar for time.Time
@@ -493,6 +534,51 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 	case reflect.Ptr:
 		return b.TypeAsGraphqlArgumentConfig(definition.Elem())
 	case reflect.Struct:
+		// Type deduplication: check if we've already created this input type
+		var typeName string
+		var useDeduplication bool
+
+		// Check if type has custom GraphQL name method
+		if method, ok := definition.MethodByName("GraphQLTypeName"); ok {
+			if method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
+				zeroValue := reflect.New(definition).Elem()
+				result := method.Func.Call([]reflect.Value{zeroValue})
+				if len(result) > 0 && result[0].Kind() == reflect.String {
+					typeName = result[0].String()
+				}
+			}
+		}
+
+		if typeName == "" {
+			typeName = definition.Name()
+		}
+
+		// Check if type deduplication is enabled
+		if b.allowSharedTypes {
+			hash := b.structHash(definition)
+			if existingTypeName, exists := b.typeHashRegistry[hash]; exists {
+				// We've seen a structurally identical type before
+				// Reuse that type name
+				typeName = existingTypeName
+				useDeduplication = true
+			} else {
+				// First time seeing this struct hash
+				b.typeHashRegistry[hash] = typeName
+			}
+		}
+
+		// If we've already registered this input type, return reference to it
+		if b.registeredInputTypes[typeName] && useDeduplication {
+			// Return the type config with the canonical name
+			// The actual type will be resolved by graphql library
+			return &graphql.ArgumentConfig{
+				Type: graphql.NewInputObject(graphql.InputObjectConfig{
+					Name:   typeName,
+					Fields: graphql.InputObjectConfigFieldMap{},
+				}),
+			}, nil
+		}
+
 		fields := graphql.InputObjectConfigFieldMap{}
 		for i := 0; i < definition.NumField(); i++ {
 			field := definition.Field(i)
@@ -518,8 +604,15 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 				Type: fieldConfig.Type,
 			}
 		}
+
+		// Mark this type as registered
+		b.registeredInputTypes[typeName] = true
+
 		return &graphql.ArgumentConfig{
-			Type: graphql.NewInputObject(graphql.InputObjectConfig{Name: definition.Name(), Fields: fields}),
+			Type: graphql.NewInputObject(graphql.InputObjectConfig{
+				Name:   typeName,
+				Fields: fields,
+			}),
 		}, nil
 	default:
 		return nil, fmt.Errorf("Unsupported type: %s", definition.Kind())
