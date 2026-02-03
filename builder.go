@@ -227,6 +227,13 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 		if definition.Kind() == reflect.Ptr {
 			realDefinition = definition.Elem()
 
+			// Check if the dereferenced type is a custom type (e.g., time.Time from *time.Time)
+			if customType, ok := b.customTypes[realDefinition]; ok {
+				return &graphql.Field{
+					Type: customType,
+				}, nil
+			}
+
 			if realDefinition.Kind() != reflect.Struct {
 				return b.TypeAsGraphqlField(realDefinition)
 			}
@@ -296,35 +303,116 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 		for i := 0; i < definition.NumMethod(); i++ {
 			method := definition.Method(i)
 			if method.IsExported() {
-				// Skip methods that don't match resolver signature (e.g., TableName(), BeforeCreate(), etc.)
+				// Try full resolver signature first (context, args, error return)
 				resolveInfo, err := NewResolveInfo(method.Func)
-				if err != nil {
-					// Not a valid resolver, skip it
-					continue
-				}
+				if err == nil {
+					// Full resolver method matched
+					// Check if we have a bound instance for this type
+					if instance, ok := b.rootInstances[realDefinition]; ok {
+						val := reflect.ValueOf(instance)
+						resolveInfo.BoundReceiver = &val
+					}
 
-				// UPDATE: Check if we have a bound instance for this type
-				if instance, ok := b.rootInstances[realDefinition]; ok {
-					val := reflect.ValueOf(instance)
-					resolveInfo.BoundReceiver = &val
-				}
+					fieldName := strings.ToLower(method.Name[0:1]) + method.Name[1:]
 
-				fieldName := strings.ToLower(method.Name[0:1]) + method.Name[1:]
-
-				graphqlField, err := b.TypeAsGraphqlField(resolveInfo.Output.Type)
-				if err != nil {
-					return nil, err
-				}
-
-				graphqlField.Name = fieldName
-				graphqlField.Resolve = resolveInfo.Resolve
-				if resolveInfo.Input != nil {
-					err := b.populateGraphqlFieldArgs(graphqlField, resolveInfo.Input.Type)
+					graphqlField, err := b.TypeAsGraphqlField(resolveInfo.Output.Type)
 					if err != nil {
 						return nil, err
 					}
+
+					graphqlField.Name = fieldName
+					graphqlField.Resolve = resolveInfo.Resolve
+					if resolveInfo.Input != nil {
+						err := b.populateGraphqlFieldArgs(graphqlField, resolveInfo.Input.Type)
+						if err != nil {
+							return nil, err
+						}
+					}
+					fields[fieldName] = graphqlField
+					continue
 				}
-				fields[fieldName] = graphqlField
+
+				// Try simple getter method: receiver-only, returns single value
+				// Signature: func (t *Type) FieldName() returnType
+				methodType := method.Type
+				if methodType.NumIn() == 1 && methodType.NumOut() == 1 {
+					returnType := methodType.Out(0)
+					// Skip if return type is error or interface{}
+					if returnType == ErrorType || returnType.Kind() == reflect.Interface {
+						continue
+					}
+
+					// Get the real return type (dereference pointer)
+					realReturnType := returnType
+					if returnType.Kind() == reflect.Ptr {
+						realReturnType = returnType.Elem()
+					}
+
+					// Skip struct return types that don't have valid gql tags
+					// This prevents creating empty GraphQL objects
+					if realReturnType.Kind() == reflect.Struct {
+						// Check if it's a custom type (like time.Time) - those are OK
+						if _, ok := b.customTypes[returnType]; !ok {
+							if _, ok := b.customTypes[realReturnType]; !ok {
+								// It's a struct without custom type - check for gql tags
+								if !hasStructValidGqlTag(realReturnType) {
+									continue
+								}
+							}
+						}
+					}
+
+					fieldName := strings.ToLower(method.Name[0:1]) + method.Name[1:]
+
+					// Skip common non-field methods
+					skipMethods := map[string]bool{
+						"tableName": true, "tableNames": true,
+						"beforeCreate": true, "afterCreate": true,
+						"beforeUpdate": true, "afterUpdate": true,
+						"beforeDelete": true, "afterDelete": true,
+						"beforeSave": true, "afterSave": true,
+						"afterFind":       true,
+						"string":          true,
+						"graphQLTypeName": true,
+						"getGroups":       true, // Already exposed via Groups field
+					}
+					if skipMethods[fieldName] {
+						continue
+					}
+
+					graphqlField, err := b.TypeAsGraphqlField(returnType)
+					if err != nil {
+						continue // Skip methods with unsupported return types
+					}
+
+					graphqlField.Name = fieldName
+					// Create simple resolver that calls the getter method
+					methodFunc := method.Func
+					graphqlField.Resolve = func(p graphql.ResolveParams) (interface{}, error) {
+						sourceVal := reflect.ValueOf(p.Source)
+						if !sourceVal.IsValid() {
+							return nil, nil
+						}
+						// Ensure we have correct type for method call
+						if sourceVal.Type().Kind() != reflect.Ptr {
+							// Method is on pointer receiver, need to get address
+							if sourceVal.CanAddr() {
+								sourceVal = sourceVal.Addr()
+							} else {
+								// Create a copy we can get address of
+								newVal := reflect.New(sourceVal.Type())
+								newVal.Elem().Set(sourceVal)
+								sourceVal = newVal
+							}
+						}
+						results := methodFunc.Call([]reflect.Value{sourceVal})
+						if len(results) > 0 {
+							return results[0].Interface(), nil
+						}
+						return nil, nil
+					}
+					fields[fieldName] = graphqlField
+				}
 			}
 		}
 
