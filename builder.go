@@ -31,20 +31,22 @@ type SchemaBuilder struct {
 	typeHashRegistry     map[string]string               // Map struct hash to canonical GraphQL type name
 	allowSharedTypes     bool                            // Enable/disable type deduplication
 	structHashCache      map[reflect.Type]string         // Cache struct hashes to avoid recalculation
-	registeredInputTypes map[string]bool                 // Track registered input types to prevent duplicates
+	inputTypeRegistry    map[reflect.Type]*graphql.InputObject // Cache input objects by Go type
+	hashToInputType      map[string]*graphql.InputObject // Cache input objects by structural hash
 }
 
 func NewSchemaBuilder() *SchemaBuilder {
 	sb := &SchemaBuilder{
-		typeRegistry:         make(map[reflect.Type]graphql.Output),
-		customTypes:          make(map[reflect.Type]graphql.Output),
-		processing:           make(map[reflect.Type]bool),
-		fieldsCache:          make(map[reflect.Type]graphql.Fields),
-		rootInstances:        make(map[reflect.Type]interface{}),
-		typeHashRegistry:     make(map[string]string),
-		allowSharedTypes:     true, // Enable by default
-		structHashCache:      make(map[reflect.Type]string),
-		registeredInputTypes: make(map[string]bool),
+		typeRegistry:      make(map[reflect.Type]graphql.Output),
+		customTypes:       make(map[reflect.Type]graphql.Output),
+		processing:        make(map[reflect.Type]bool),
+		fieldsCache:       make(map[reflect.Type]graphql.Fields),
+		rootInstances:     make(map[reflect.Type]interface{}),
+		typeHashRegistry:  make(map[string]string),
+		allowSharedTypes:  true, // Enable by default
+		structHashCache:   make(map[reflect.Type]string),
+		inputTypeRegistry: make(map[reflect.Type]*graphql.InputObject),
+		hashToInputType:   make(map[string]*graphql.InputObject),
 	}
 
 	// Register default custom types (standard library types only)
@@ -534,11 +536,15 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 	case reflect.Ptr:
 		return b.TypeAsGraphqlArgumentConfig(definition.Elem())
 	case reflect.Struct:
-		// Type deduplication: check if we've already created this input type
-		var typeName string
-		var useDeduplication bool
+		// First check if we've already created an InputObject for this Go type
+		if cached, ok := b.inputTypeRegistry[definition]; ok {
+			return &graphql.ArgumentConfig{
+				Type: cached,
+			}, nil
+		}
 
-		// Check if type has custom GraphQL name method
+		// Determine the GraphQL type name
+		var typeName string
 		if method, ok := definition.MethodByName("GraphQLTypeName"); ok {
 			if method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
 				zeroValue := reflect.New(definition).Elem()
@@ -553,32 +559,61 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 			typeName = definition.Name()
 		}
 
-		// Check if type deduplication is enabled
+		// If deduplication is enabled, check if a structurally identical type was already created
 		if b.allowSharedTypes {
 			hash := b.structHash(definition)
-			if existingTypeName, exists := b.typeHashRegistry[hash]; exists {
-				// We've seen a structurally identical type before
-				// Reuse that type name
-				typeName = existingTypeName
-				useDeduplication = true
-			} else {
-				// First time seeing this struct hash
-				b.typeHashRegistry[hash] = typeName
+			if existingInputType, exists := b.hashToInputType[hash]; exists {
+				// We've seen this structure before - reuse the existing InputObject
+				b.inputTypeRegistry[definition] = existingInputType
+				return &graphql.ArgumentConfig{
+					Type: existingInputType,
+				}, nil
 			}
-		}
 
-		// If we've already registered this input type, return reference to it
-		if b.registeredInputTypes[typeName] && useDeduplication {
-			// Return the type config with the canonical name
-			// The actual type will be resolved by graphql library
+			// Build and cache the fields
+			fields := graphql.InputObjectConfigFieldMap{}
+			for i := 0; i < definition.NumField(); i++ {
+				field := definition.Field(i)
+				fieldName, isNonNull, err := GetGqlTag(&field)
+				if err != nil {
+					return nil, err
+				}
+
+				if fieldName == "" || fieldName == "-" {
+					continue
+				}
+
+				fieldConfig, err := b.TypeAsGraphqlArgumentConfig(field.Type)
+				if err != nil {
+					return nil, err
+				}
+
+				if isNonNull {
+					fieldConfig.Type = graphql.NewNonNull(fieldConfig.Type)
+				}
+
+				fields[fieldName] = &graphql.InputObjectFieldConfig{
+					Type: fieldConfig.Type,
+				}
+			}
+
+			// Create the InputObject
+			inputObj := graphql.NewInputObject(graphql.InputObjectConfig{
+				Name:   typeName,
+				Fields: fields,
+			})
+
+			// Cache by both Go type and structural hash
+			b.inputTypeRegistry[definition] = inputObj
+			b.hashToInputType[hash] = inputObj
+			b.typeHashRegistry[hash] = typeName
+
 			return &graphql.ArgumentConfig{
-				Type: graphql.NewInputObject(graphql.InputObjectConfig{
-					Name:   typeName,
-					Fields: graphql.InputObjectConfigFieldMap{},
-				}),
+				Type: inputObj,
 			}, nil
 		}
 
+		// Deduplication disabled - create a new InputObject without caching by hash
 		fields := graphql.InputObjectConfigFieldMap{}
 		for i := 0; i < definition.NumField(); i++ {
 			field := definition.Field(i)
@@ -605,14 +640,16 @@ func (b *SchemaBuilder) TypeAsGraphqlArgumentConfig(definition reflect.Type) (*g
 			}
 		}
 
-		// Mark this type as registered
-		b.registeredInputTypes[typeName] = true
+		inputObj := graphql.NewInputObject(graphql.InputObjectConfig{
+			Name:   typeName,
+			Fields: fields,
+		})
+
+		// Only cache by Go type, not by hash
+		b.inputTypeRegistry[definition] = inputObj
 
 		return &graphql.ArgumentConfig{
-			Type: graphql.NewInputObject(graphql.InputObjectConfig{
-				Name:   typeName,
-				Fields: fields,
-			}),
+			Type: inputObj,
 		}, nil
 	default:
 		return nil, fmt.Errorf("Unsupported type: %s", definition.Kind())
