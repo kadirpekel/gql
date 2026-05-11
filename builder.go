@@ -19,6 +19,13 @@ const (
 	Subscription RootType = "Subscription"
 )
 
+// FieldMiddlewareFunc wraps a GraphQL field resolver, enabling cross-cutting
+// concerns such as authorization, logging, and observability to be applied
+// uniformly across all fields without modifying individual resolvers.
+// Middleware is applied in registration order: the first registered is the
+// outermost wrapper (runs first on the way in, last on the way out).
+type FieldMiddlewareFunc func(next graphql.FieldResolveFn) graphql.FieldResolveFn
+
 type SchemaBuilder struct {
 	query                interface{}
 	mutation             interface{}
@@ -33,6 +40,7 @@ type SchemaBuilder struct {
 	structHashCache      map[reflect.Type]string         // Cache struct hashes to avoid recalculation
 	inputTypeRegistry    map[reflect.Type]*graphql.InputObject // Cache input objects by Go type
 	hashToInputType      map[string]*graphql.InputObject // Cache input objects by structural hash
+	middlewares          []FieldMiddlewareFunc           // Field resolver middleware chain
 }
 
 func NewSchemaBuilder() *SchemaBuilder {
@@ -47,6 +55,7 @@ func NewSchemaBuilder() *SchemaBuilder {
 		structHashCache:   make(map[reflect.Type]string),
 		inputTypeRegistry: make(map[reflect.Type]*graphql.InputObject),
 		hashToInputType:   make(map[string]*graphql.InputObject),
+		middlewares:       nil,
 	}
 
 	// Register default custom types (standard library types only)
@@ -61,6 +70,22 @@ func NewSchemaBuilder() *SchemaBuilder {
 // RegisterCustomType registers a custom type mapping
 func (b *SchemaBuilder) RegisterCustomType(goType reflect.Type, graphqlType graphql.Output) {
 	b.customTypes[goType] = graphqlType
+}
+
+// WithFieldMiddleware appends a middleware to the resolver chain. Middlewares
+// are applied to every method-based field resolver built by the schema builder.
+// Use this for cross-cutting concerns such as authorization enforcement.
+func (b *SchemaBuilder) WithFieldMiddleware(fn FieldMiddlewareFunc) *SchemaBuilder {
+	b.middlewares = append(b.middlewares, fn)
+	return b
+}
+
+// wrapResolve applies the registered middleware chain to a field resolver.
+func (b *SchemaBuilder) wrapResolve(fn graphql.FieldResolveFn) graphql.FieldResolveFn {
+	for i := len(b.middlewares) - 1; i >= 0; i-- {
+		fn = b.middlewares[i](fn)
+	}
+	return fn
 }
 
 // AllowSharedTypes enables or disables type deduplication
@@ -364,7 +389,7 @@ func (b *SchemaBuilder) TypeAsGraphqlField(definition reflect.Type) (*graphql.Fi
 					}
 
 					graphqlField.Name = fieldName
-					graphqlField.Resolve = resolveInfo.Resolve
+					graphqlField.Resolve = b.wrapResolve(resolveInfo.Resolve)
 					if resolveInfo.Input != nil {
 						err := b.populateGraphqlFieldArgs(graphqlField, resolveInfo.Input.Type)
 						if err != nil {
